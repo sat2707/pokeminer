@@ -28,6 +28,10 @@ import pokemon_pb2
 import utils
 
 
+ACCOUNTS = [acc for acc in config.ACCOUNTS if acc[2] == 'google']
+random.shuffle(ACCOUNTS)
+
+
 requests.packages.urllib3.disable_warnings(InsecureRequestWarning)
 
 API_URL = 'https://pgorelease.nianticlabs.com/plfe/rpc'
@@ -264,17 +268,30 @@ def get_profile(service, access_token, api, useauth, *reqq):
     return retrying_api_req(service, api, access_token, req, useauth=useauth)
 
 
-def login_google(username, password):
+def login_google(username, password, worker):
     logger.info('Google login for: %s', username)
+    worker.error_code = 'GMASTERLOGIN'
     r1 = perform_master_login(username, password, ANDROID_ID)
-    r2 = perform_oauth(
-        username,
-        r1.get('Token', ''),
-        ANDROID_ID,
-        SERVICE,
-        APP,
-        CLIENT_SIG,
-    )
+    tries = 5
+    worker.error_code = 'GOAUTH{}'.format(tries)
+    while tries:
+        r2 = perform_oauth(
+            username,
+            r1.get('Token', ''),
+            ANDROID_ID,
+            SERVICE,
+            APP,
+            CLIENT_SIG,
+        )
+        if r2.get('Auth'):
+            worker.error_code = 'GOAUTHED'
+            break
+        else:
+            worker.error_code = 'GOAUTH{}'.format(tries)
+            tries -= 1
+            time.sleep(2)
+    if not r2.get('Auth'):
+        worker.error_code = 'GOAUTHFAIL'
     return r2.get('Auth')
 
 
@@ -366,7 +383,7 @@ def get_heartbeat(service, api_endpoint, access_token, response):
     return heartbeat
 
 
-def get_token(service, username, password):
+def get_token(service, username, password, worker):
     if service == 'ptc':
         global_token = None
         while not global_token:
@@ -375,14 +392,16 @@ def get_token(service, username, password):
                 logger.info('Could not login to PTC - sleeping')
                 time.sleep(random.randint(10, 20))
     else:
-        global_token = login_google(username, password)
+        global_token = login_google(username, password, worker)
     return global_token
 
 
-def login(username, password, service):
-    access_token = get_token(service, username, password)
+def login(username, password, service, worker):
+    worker.error_code = 'GETTOKEN'
+    access_token = get_token(service, username, password, worker)
     if access_token is None:
-        raise Exception('[-] Wrong username/password')
+        raise NoToken()
+    worker.error_code = 'GOTTOKEN'
 
     logger.debug('RPC Session Token: %s...', access_token[:25])
 
@@ -422,6 +441,10 @@ def login(username, password, service):
     return api_endpoint, access_token, profile_response
 
 
+class NoToken(Exception):
+    pass
+
+
 class Slave(threading.Thread):
     def __init__(
         self,
@@ -439,31 +462,48 @@ class Slave(threading.Thread):
         self.step = 0
         self.cycle = 0
         self.seen = 0
+        self.error_code = "STARTING"
 
     def run(self):
         self.cycle = 1
-        self.error_code = None
+        time.sleep(random.random()*8)
 
         # Login sequentially for PTC
-        service = config.ACCOUNTS[self.worker_no][2]
+        ACCOUNT = ACCOUNTS[self.worker_no][2]
         api_session = local_data.api_session = requests.session()
         api_session.headers.update({'User-Agent': 'Niantic App'})
         api_session.verify = False
 
-        try:
-            api_endpoint, access_token, profile_response = login(
-                username=config.ACCOUNTS[self.worker_no][0],
-                password=config.ACCOUNTS[self.worker_no][1],
-                service=service,
-            )
-        except CannotGetProfile:
-            # OMG! Sleep for a bit and restart the thread
-            self.error_code = 'LOGIN FAIL'
-            time.sleep(random.randint(5, 10))
+        self.error_code = 'LOGIN'
+
+        tries = 3
+        got_token = False
+        while tries:
+            try:
+                api_endpoint, access_token, profile_response = login(
+                    username=ACCOUNT[0],
+                    password=ACCOUNT[1],
+                    service=ACCOUNT[2],
+                    worker=self
+                )
+                got_token = True
+                break
+            except NoToken:
+                self.error_code = 'NO TOKEN'
+                tries -= 1
+                ACCOUNT = random.choice(ACCOUNTS)
+            except CannotGetProfile:
+                self.error_code = 'NO PROFILE'
+                tries -= 1
+
+        if not got_token:
             start_worker(self.worker_no, self.points)
             return
+
+        self.error_code = 'LOGGEDIN'
+
         while self.cycle <= 3:
-            self.main(service, api_endpoint, access_token, profile_response)
+            self.main(ACCOUNT[2], api_endpoint, access_token, profile_response)
             self.cycle += 1
             if self.cycle <= 3:
                 self.error_code = 'SLEEP'
@@ -623,11 +663,9 @@ def spawn_workers(workers, status_bar=True):
     }
     while True:
         if status_bar:
-            if sys.platform == 'win32':
-                _ = os.system('cls')
-            else:
-                _ = os.system('clear')
-            print get_status_message(workers, count, start_time, points_stats)
+            sf = open('../status', 'w')
+            sf.write(get_status_message(workers, count, start_time, points_stats))
+            sf.close()
         time.sleep(0.5)
 
 
@@ -650,7 +688,7 @@ def parse_args():
 if __name__ == '__main__':
     args = parse_args()
     if args.status_bar:
-        configure_logger(filename='worker.log')
+        configure_logger(filename='../worker.log')
         logger.info('-' * 30)
         logger.info('Starting up!')
     else:
